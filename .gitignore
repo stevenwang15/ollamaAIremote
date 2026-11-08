@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+# Holds the client allow-list and the admin key. Never commit it.
+api_keys.json
+api_keys.json.tmp

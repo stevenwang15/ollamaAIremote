@@ -1,0 +1,3 @@
+-r requirements.txt
+# TestClient needs an HTTP client; python-dotenv is optional at runtime.
+httpx>=0.27
