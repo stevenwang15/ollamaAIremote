@@ -26,7 +26,7 @@ The admin key comes from `ADMIN_API_KEY`, or — when that is unset — is gener
 - ⚡ **Streaming** — SSE chunks for `stream=true`, iterated off the event loop.
 - 📊 **Real token usage** — `usage` is filled from Ollama's own `prompt_eval_count` / `eval_count` instead of being hardcoded to 0.
 - ⚙️ **Env configuration** — Ollama address, listen host/port, timeout and keys via `.env`.
-- 📦 **One-click start** — macOS / Linux / Windows; `start.sh` creates the venv and installs dependencies.
+- 📦 **One-click start** — macOS / Linux (Git Bash or WSL on Windows); `start.sh` creates the venv and installs dependencies.
 - 🧩 **Non-intrusive proxy** — pass-through to Ollama, no model logic changed.
 
 ## Prerequisites
@@ -45,7 +45,7 @@ chmod +x start.sh
 ./start.sh
 ```
 
-The proxy listens on `http://localhost:11433`.
+The proxy listens on `http://localhost:11433`. Note that the default `LISTEN_HOST=0.0.0.0` exposes it to your whole network — set `LISTEN_HOST=127.0.0.1` in `.env` if you only need it locally.
 
 ## Configuration
 
@@ -85,6 +85,8 @@ curl -X POST http://localhost:11433/api/keys \
 # {"api_key":"sk-…","name":null}
 ```
 
+`$ADMIN_API_KEY` is the value of `ADMIN_API_KEY` in your `.env`, or — if you left it empty — the generated key stored in `KEYS_FILE` (the first-start log message points at that file).
+
 ### Chat request
 
 ```bash
@@ -115,7 +117,7 @@ print(response.usage)  # prompt / completion / total, from Ollama's own counters
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers the security property the project exists for — a client key must not be able to mint more client keys — plus persistence across restart, `max_tokens → num_predict`, and real token usage. It needs `requirements-dev.txt` (`httpx` for `TestClient`).
+The suite covers the security property the project exists for — a client key must not be able to mint more client keys — plus persistence across restart, `max_tokens → num_predict`, real token usage, parameter mapping (`temperature`/`stop`/`seed` into Ollama's `options`), and error handling. It needs `requirements-dev.txt` (`httpx` for `TestClient`).
 
 `./test.sh` is the complementary live smoke test against a running proxy; it requires `ADMIN_API_KEY`.
 

@@ -14,7 +14,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 import hashlib
 import json
 import logging
@@ -39,13 +39,30 @@ app = FastAPI(title="OpenAI to Ollama API Proxy", version="1.1.0")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
-LISTEN_PORT = int(os.getenv("LISTEN_PORT", "11433"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
+
+
+def _env_number(name: str, default: str, cast):
+    # A typo in .env should name the variable, not dump a traceback. An empty
+    # value means "unset", the same convention .env.example uses for keys.
+    raw = os.getenv(name) or default
+    try:
+        return cast(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a valid {cast.__name__}, got {raw!r}")
+
+
+LISTEN_PORT = _env_number("LISTEN_PORT", "11433", int)
+REQUEST_TIMEOUT = _env_number("REQUEST_TIMEOUT", "300", float)
 API_KEY_HEADER = APIKeyHeader(name="Authorization", auto_error=False)
 
 # Where the allow-list and the generated admin key live. Kept out of the source
 # tree by .gitignore; created with 0600 because it holds credentials.
 KEYS_FILE = Path(os.getenv("KEYS_FILE", "api_keys.json"))
+if not KEYS_FILE.is_absolute():
+    # Anchor relative paths beside this file, not the caller's cwd: starting
+    # the proxy from another directory must not silently scatter (and lose)
+    # the key store.
+    KEYS_FILE = Path(__file__).resolve().parent / KEYS_FILE
 
 
 # ── key store ────────────────────────────────────────────────────────────────
@@ -57,11 +74,22 @@ def _load_store() -> Dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("cannot read %s (%s); starting from an empty allow-list", KEYS_FILE, exc)
         return {"keys": [], "admin": None}
-    return {"keys": list(data.get("keys") or []), "admin": data.get("admin")}
+    # A hand-edited or mangled file must not crash startup, and must never
+    # degrade into single-character "keys" that would authenticate anything.
+    if not isinstance(data, dict):
+        log.warning("%s is not a JSON object; starting from an empty allow-list", KEYS_FILE)
+        return {"keys": [], "admin": None}
+    keys = data.get("keys")
+    admin = data.get("admin")
+    return {
+        "keys": keys if isinstance(keys, list) else [],
+        "admin": admin if isinstance(admin, str) else None,
+    }
 
 
 def _save_store() -> None:
     payload = {"keys": sorted(VALID_API_KEYS), "admin": ADMIN_API_KEY}
+    KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = KEYS_FILE.with_suffix(KEYS_FILE.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     os.chmod(tmp, 0o600)
@@ -94,6 +122,7 @@ def _bearer(auth_header: Optional[str]) -> str:
             headers={"WWW-Authenticate": "Bearer"},
         )
     scheme, _, token = auth_header.partition(" ")
+    token = token.strip()
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -103,10 +132,16 @@ def _bearer(auth_header: Optional[str]) -> str:
     return token
 
 
+def _key_matches(a: str, b: str) -> bool:
+    # compare_digest() raises TypeError on non-ASCII str, which would turn a
+    # junk header into a 500; compare UTF-8 bytes instead.
+    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
 async def get_api_key(auth_header: Optional[str] = Depends(API_KEY_HEADER)) -> str:
     """A client key: must be on the allow-list."""
     token = _bearer(auth_header)
-    if not any(secrets.compare_digest(token, k) for k in VALID_API_KEYS):
+    if not any(_key_matches(token, k) for k in VALID_API_KEYS):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
@@ -118,7 +153,7 @@ async def get_api_key(auth_header: Optional[str] = Depends(API_KEY_HEADER)) -> s
 async def require_admin(auth_header: Optional[str] = Depends(API_KEY_HEADER)) -> str:
     """The admin key: the only thing allowed to change the allow-list."""
     token = _bearer(auth_header)
-    if not secrets.compare_digest(token, ADMIN_API_KEY):
+    if not _key_matches(token, ADMIN_API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Admin API key required",
@@ -138,8 +173,11 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None  # newer OpenAI SDKs send this
     stream: Optional[bool] = False
     top_p: Optional[float] = None
+    stop: Optional[Union[str, List[str]]] = None
+    seed: Optional[int] = None
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
 
@@ -147,7 +185,7 @@ class ChatCompletionRequest(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: str = "stop"
+    finish_reason: Optional[str] = "stop"  # Ollama can report done=false
 
 
 class ChatCompletionResponse(BaseModel):
@@ -175,13 +213,20 @@ def _ollama_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     }
     options: Dict[str, Any] = {}
     if request.temperature is not None:
-        payload["temperature"] = request.temperature
-    if request.max_tokens:
+        # Ollama only reads sampling parameters from `options`; a top-level
+        # `temperature` on /api/chat is ignored, so it used to be a no-op.
+        options["temperature"] = request.temperature
+    max_output = request.max_tokens or request.max_completion_tokens
+    if max_output:
         # OpenAI's max_tokens caps the *output*; Ollama's equivalent is num_predict.
         # (num_ctx, which this used to set, is the context window — a different thing.)
-        options["num_predict"] = request.max_tokens
+        options["num_predict"] = max_output
     if request.top_p is not None:
         options["top_p"] = request.top_p
+    if request.stop is not None:
+        options["stop"] = [request.stop] if isinstance(request.stop, str) else request.stop
+    if request.seed is not None:
+        options["seed"] = request.seed
     if request.frequency_penalty is not None:
         options["frequency_penalty"] = request.frequency_penalty
     if request.presence_penalty is not None:
@@ -189,6 +234,22 @@ def _ollama_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     if options:
         payload["options"] = options
     return payload
+
+
+def _ollama_error(exc: requests.exceptions.RequestException) -> HTTPException:
+    """Turn a backend failure into an honest client-facing error: Ollama's own
+    message when it sent one, and its 4xx status when the request was the
+    problem (a bad model name is not "unreachable")."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
+    try:
+        message = response.json().get("error")
+    except (ValueError, AttributeError):
+        message = None
+    detail = f"Ollama error: {message}" if message else f"Ollama error: {exc}"
+    status_code = response.status_code if 400 <= response.status_code < 500 else 502
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 # ── OpenAI-compatible surface ────────────────────────────────────────────────
@@ -200,7 +261,16 @@ async def list_models(api_key: str = Depends(get_api_key)):
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
+        raise _ollama_error(exc)
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama returned an unexpected response; check OLLAMA_BASE_URL",
+        )
 
     models = [
         {
@@ -209,7 +279,7 @@ async def list_models(api_key: str = Depends(get_api_key)):
             "created": 0,
             "owned_by": "ollama",
         }
-        for m in response.json().get("models", [])
+        for m in body.get("models", [])
     ]
     return {"object": "list", "data": models}
 
@@ -224,13 +294,19 @@ async def chat_completions(
     url = f"{OLLAMA_BASE_URL}/api/chat"
 
     if request.stream:
+        response = None
         try:
             response = await run_in_threadpool(
                 requests.post, url, json=payload, stream=True, timeout=REQUEST_TIMEOUT
             )
             response.raise_for_status()
         except requests.exceptions.RequestException as exc:
-            raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
+            # Build the error first — it may need to read the response body —
+            # then close so the unread stream does not leak the connection.
+            error = _ollama_error(exc)
+            if response is not None:
+                response.close()
+            raise error
 
         def generate():
             # Starlette runs a sync iterator in a worker thread, so this does not
@@ -243,6 +319,11 @@ async def chat_completions(
                         data = json.loads(line.decode("utf-8"))
                     except json.JSONDecodeError:
                         continue
+                    if data.get("error"):
+                        # Ollama reports some failures (bad model, load error)
+                        # as an error object inside the stream itself.
+                        yield f"data: {json.dumps({'error': {'message': data['error']}})}\n\n"
+                        break
                     done = bool(data.get("done"))
                     chunk = {
                         "id": chat_id,
@@ -263,9 +344,16 @@ async def chat_completions(
                     yield f"data: {json.dumps(chunk)}\n\n"
                     if done:
                         break
+            except requests.exceptions.RequestException as exc:
+                # Connection dropped mid-stream: log it and end without [DONE]
+                # so the client can tell the stream was truncated.
+                log.warning("stream from Ollama aborted: %s", exc)
+                return
             finally:
                 response.close()
-                yield "data: [DONE]\n\n"
+            # After the finally, not in it: yielding while a GeneratorExit is
+            # in flight (client disconnect) raises RuntimeError.
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -275,9 +363,17 @@ async def chat_completions(
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
+        raise _ollama_error(exc)
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama returned an unexpected response; check OLLAMA_BASE_URL",
+        )
     prompt_tokens = int(data.get("prompt_eval_count") or 0)
     completion_tokens = int(data.get("eval_count") or 0)
 
@@ -328,7 +424,7 @@ async def list_api_keys(admin: str = Depends(require_admin)):
 @app.delete("/api/keys/{api_key}")
 async def delete_api_key(api_key: str, admin: str = Depends(require_admin)):
     for existing in list(VALID_API_KEYS):
-        if secrets.compare_digest(existing, api_key):
+        if _key_matches(existing, api_key):
             VALID_API_KEYS.discard(existing)
             _save_store()
             return {"status": "deleted"}
@@ -344,7 +440,8 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    log.basicConfig(level=logging.INFO)
+    # `log` is a Logger instance; basicConfig lives on the module.
+    logging.basicConfig(level=logging.INFO)
     if not os.getenv("ADMIN_API_KEY"):
         log.warning(
             "ADMIN_API_KEY is not set; using the generated admin key stored in %s",
