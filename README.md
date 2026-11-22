@@ -13,7 +13,7 @@ Two kinds of credential, deliberately kept separate:
 | Credential | What it can do |
 | :--- | :--- |
 | **Admin key** | Create, list and delete client keys. Cannot reach Ollama. |
-| **Client key** | Call `/v1/models` and `/v1/chat/completions`. Cannot manage keys. |
+| **Client key** | Call `/v1/models`, `/v1/chat/completions` and `/v1/embeddings`. Cannot manage keys. |
 
 That split is the whole point: if a client key could create keys, the allow-list would mean nothing, since any client could mint itself a new one and walk straight past the gate.
 
@@ -21,9 +21,11 @@ The admin key comes from `ADMIN_API_KEY`, or — when that is unset — is gener
 
 ## Features
 
-- 🔑 **API key authentication & management** — admin-scoped create / list / delete; the allow-list is persisted, not in-memory only.
-- 🔄 **OpenAI-compatible endpoints** — `/v1/models`, `/v1/chat/completions`.
-- ⚡ **Streaming** — SSE chunks for `stream=true`, iterated off the event loop.
+- 🔑 **API key authentication & management** — admin-scoped create / list / delete, with optional names; the allow-list is persisted, not in-memory only.
+- 🔄 **OpenAI-compatible endpoints** — `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`.
+- 🧠 **Embeddings for RAG** — `POST /v1/embeddings` maps to Ollama's `/api/embed`, accepting a single string or a batch.
+- 🛠 **Tool calling** — OpenAI `tools` are passed through to Ollama, and Ollama's `tool_calls` are converted back (object `arguments` → JSON string, generated call ids, `finish_reason: "tool_calls"`). Tool history (`tool_calls` / `tool_call_id`) is forwarded instead of dropped.
+- ⚡ **Streaming** — SSE chunks for `stream=true`, iterated off the event loop; `stream_options.include_usage` appends a final usage chunk.
 - 📊 **Real token usage** — `usage` is filled from Ollama's own `prompt_eval_count` / `eval_count` instead of being hardcoded to 0.
 - ⚙️ **Env configuration** — Ollama address, listen host/port, timeout and keys via `.env`.
 - 📦 **One-click start** — macOS / Linux (Git Bash or WSL on Windows); `start.sh` creates the venv and installs dependencies.
@@ -63,6 +65,8 @@ REQUEST_TIMEOUT=300
 ```
 
 > **Upgrading from 1.0:** the old `API_KEYS` whitelist is no longer read. Client keys now live in `KEYS_FILE` and are created through the admin-authenticated `/api/keys` endpoint.
+>
+> **Upgrading from 1.1:** `KEYS_FILE` gains an optional `meta` object that stores each key's name and issue time. Files written by 1.1 load unchanged — the field is simply absent until the next key is created.
 
 ## API endpoints
 
@@ -70,9 +74,10 @@ REQUEST_TIMEOUT=300
 | :--- | :--- | :--- | :--- |
 | `/health` | GET | none | Health probe, unauthenticated by design |
 | `/v1/models` | GET | client key | List available Ollama models |
-| `/v1/chat/completions` | POST | client key | Chat completion (normal or streaming) |
-| `/api/keys` | POST | **admin key** | Create a client key |
-| `/api/keys` | GET | **admin key** | List client keys (masked) |
+| `/v1/chat/completions` | POST | client key | Chat completion (normal or streaming, with optional tools) |
+| `/v1/embeddings` | POST | client key | Embeddings for a string or a batch of strings |
+| `/api/keys` | POST | **admin key** | Create a client key (optional `{"name": "…"}`) |
+| `/api/keys` | GET | **admin key** | List client keys (masked, with name and issue time) |
 | `/api/keys/{api_key}` | DELETE | **admin key** | Delete a client key |
 
 ## Usage
@@ -81,8 +86,10 @@ REQUEST_TIMEOUT=300
 
 ```bash
 curl -X POST http://localhost:11433/api/keys \
-  -H "Authorization: Bearer $ADMIN_API_KEY"
-# {"api_key":"sk-…","name":null}
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"laptop"}'
+# {"api_key":"sk-…","name":"laptop"}
 ```
 
 `$ADMIN_API_KEY` is the value of `ADMIN_API_KEY` in your `.env`, or — if you left it empty — the generated key stored in `KEYS_FILE` (the first-start log message points at that file).
@@ -111,15 +118,56 @@ print(response.choices[0].message.content)
 print(response.usage)  # prompt / completion / total, from Ollama's own counters
 ```
 
+### Embeddings
+
+```python
+vectors = client.embeddings.create(model="nomic-embed-text", input=["first", "second"])
+print(len(vectors.data), len(vectors.data[0].embedding))
+```
+
+### Tool calling
+
+```python
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Look up the weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="llama3.1", messages=[{"role": "user", "content": "Weather in Paris?"}], tools=tools
+)
+call = response.choices[0].message.tool_calls[0]
+print(response.choices[0].finish_reason)  # "tool_calls"
+print(call.function.name, call.function.arguments)  # arguments is a JSON string
+```
+
+Send the tool result back with `{"role": "tool", "tool_call_id": call.id, "content": "sunny"}`;
+the proxy forwards that history to Ollama instead of dropping it.
+
+### Streaming with usage
+
+Request `"stream": true, "stream_options": {"include_usage": true}` and the last chunk
+before `data: [DONE]` carries `usage` with an empty `choices` array.
+
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers the security property the project exists for — a client key must not be able to mint more client keys — plus persistence across restart, `max_tokens → num_predict`, real token usage, parameter mapping (`temperature`/`stop`/`seed` into Ollama's `options`), and error handling. It needs `requirements-dev.txt` (`httpx` for `TestClient`).
+The suite covers the security property the project exists for — a client key must not be able to mint more client keys — plus persistence across restart, `max_tokens → num_predict`, real token usage, parameter mapping (`temperature`/`stop`/`seed` into Ollama's `options`), embeddings, tool-call translation, streamed usage, key names, and error handling. It needs `requirements-dev.txt` (`httpx` for `TestClient`).
 
-`./test.sh` is the complementary live smoke test against a running proxy; it requires `ADMIN_API_KEY`.
+`./test.sh` is the complementary live smoke test against a running proxy; it requires `ADMIN_API_KEY`. Set `EMBED_MODEL=nomic-embed-text` to include the embeddings step.
 
 ## Project structure
 

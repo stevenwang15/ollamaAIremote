@@ -391,5 +391,271 @@ class ConfigTests(unittest.TestCase):
                     os.environ[name] = value
 
 
+class EmbeddingTests(unittest.TestCase):
+    """`/v1/embeddings` is what RAG clients call before they ever chat."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.main = fresh_app(os.path.join(self.tmp.name, "api_keys.json"))
+        from fastapi.testclient import TestClient
+
+        self.client = TestClient(self.main.app)
+        self.client.__enter__()
+        self.headers = {
+            "Authorization": "Bearer "
+            + self.client.post(
+                "/api/keys", headers={"Authorization": f"Bearer {ADMIN}"}
+            ).json()["api_key"]
+        }
+
+    def tearDown(self):
+        self.client.__exit__(None, None, None)
+        self.tmp.cleanup()
+        sys.modules.pop("main", None)
+
+    def _post_embed(self, payload, ollama_body):
+        with mock.patch.object(self.main.requests, "post") as post:
+            post.return_value.raise_for_status.return_value = None
+            post.return_value.json.return_value = ollama_body
+            return self.client.post("/v1/embeddings", headers=self.headers, json=payload)
+
+    def test_a_plain_string_is_wrapped_in_a_batch(self):
+        r = self._post_embed(
+            {"model": "nomic-embed-text", "input": "hello"},
+            {"embeddings": [[0.1, 0.2]], "prompt_eval_count": 4},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["object"], "list")
+        self.assertEqual(body["data"][0]["embedding"], [0.1, 0.2])
+        self.assertEqual(body["data"][0]["index"], 0)
+        self.assertEqual(body["usage"], {"prompt_tokens": 4, "total_tokens": 4})
+
+    def test_a_batch_keeps_every_vector_in_order(self):
+        r = self._post_embed(
+            {"model": "nomic-embed-text", "input": ["a", "b"]},
+            {"embeddings": [[1.0], [2.0]], "prompt_eval_count": 6},
+        )
+        self.assertEqual([d["index"] for d in r.json()["data"]], [0, 1])
+        self.assertEqual([d["embedding"] for d in r.json()["data"]], [[1.0], [2.0]])
+
+    def test_an_empty_list_is_rejected_without_calling_ollama(self):
+        with mock.patch.object(self.main.requests, "post") as post:
+            r = self.client.post(
+                "/v1/embeddings",
+                headers=self.headers,
+                json={"model": "nomic-embed-text", "input": []},
+            )
+        self.assertEqual(r.status_code, 400)
+        post.assert_not_called()
+
+    def test_a_vector_count_mismatch_is_a_backend_error_not_an_index_error(self):
+        r = self._post_embed(
+            {"model": "nomic-embed-text", "input": ["a", "b"]},
+            {"embeddings": [[1.0]]},
+        )
+        self.assertEqual(r.status_code, 502)
+        self.assertIn("no embeddings", r.json()["detail"])
+
+
+class ToolCallingTests(unittest.TestCase):
+    """Ollama speaks tools, but with a different wire format than OpenAI."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.main = fresh_app(os.path.join(self.tmp.name, "api_keys.json"))
+        from fastapi.testclient import TestClient
+
+        self.client = TestClient(self.main.app)
+        self.client.__enter__()
+        self.key = self.client.post(
+            "/api/keys", headers={"Authorization": f"Bearer {ADMIN}"}
+        ).json()["api_key"]
+        self.headers = {"Authorization": f"Bearer {self.key}"}
+
+    def tearDown(self):
+        self.client.__exit__(None, None, None)
+        self.tmp.cleanup()
+        sys.modules.pop("main", None)
+
+    def test_tool_definitions_and_tool_history_reach_ollama(self):
+        req = self.main.ChatCompletionRequest(
+            model="llama3",
+            messages=[
+                self.main.ChatMessage(role="user", content="weather?"),
+                self.main.ChatMessage(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
+                        }
+                    ],
+                ),
+                self.main.ChatMessage(
+                    role="tool", content="sunny", tool_call_id="call_1", name="get_weather"
+                ),
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Look up the weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+        payload = self.main._ollama_payload(req)
+        self.assertEqual(payload["tools"][0]["function"]["name"], "get_weather")
+        messages = payload["messages"]
+        self.assertEqual(messages[0]["content"], "weather?")
+        # A tool-only assistant turn has no text; it must not become "None".
+        self.assertEqual(messages[1]["content"], "")
+        self.assertEqual(messages[1]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(messages[2]["tool_call_id"], "call_1")
+        self.assertEqual(messages[2]["name"], "get_weather")
+
+    def test_ollama_arguments_object_becomes_a_json_string(self):
+        r = None
+        with mock.patch.object(self.main.requests, "post") as post:
+            post.return_value.raise_for_status.return_value = None
+            post.return_value.json.return_value = {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "Paris"}}}],
+                },
+                "done": True,
+                "prompt_eval_count": 9,
+                "eval_count": 3,
+            }
+            r = self.client.post(
+                "/v1/chat/completions",
+                headers=self.headers,
+                json={
+                    "model": "llama3",
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                },
+            )
+
+        self.assertEqual(r.status_code, 200)
+        choice = r.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertIsNone(choice["message"]["content"])
+        call = choice["message"]["tool_calls"][0]
+        self.assertEqual(call["type"], "function")
+        self.assertTrue(call["id"].startswith("call_"))
+        self.assertEqual(call["function"]["name"], "get_weather")
+        # An SDK will json.loads() this; an object here would crash it.
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"city": "Paris"})
+
+    def test_a_text_reply_still_ends_with_stop(self):
+        with mock.patch.object(self.main.requests, "post") as post:
+            post.return_value.raise_for_status.return_value = None
+            post.return_value.json.return_value = {
+                "message": {"role": "assistant", "content": "hi"},
+                "done": True,
+            }
+            r = self.client.post(
+                "/v1/chat/completions",
+                headers=self.headers,
+                json={"model": "llama3", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        self.assertEqual(r.json()["choices"][0]["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", r.json()["choices"][0]["message"])
+
+
+class StreamUsageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.main = fresh_app(os.path.join(self.tmp.name, "api_keys.json"))
+        from fastapi.testclient import TestClient
+
+        self.client = TestClient(self.main.app)
+        self.client.__enter__()
+        self.headers = {
+            "Authorization": "Bearer "
+            + self.client.post(
+                "/api/keys", headers={"Authorization": f"Bearer {ADMIN}"}
+            ).json()["api_key"]
+        }
+
+    def tearDown(self):
+        self.client.__exit__(None, None, None)
+        self.tmp.cleanup()
+        sys.modules.pop("main", None)
+
+    def _stream(self, extra):
+        with mock.patch.object(self.main.requests, "post") as post:
+            post.return_value.raise_for_status.return_value = None
+            post.return_value.iter_lines.return_value = iter(
+                [
+                    b'{"message": {"role": "assistant", "content": "hi"}, "done": false}',
+                    b'{"message": {"role": "assistant", "content": ""}, "done": true,'
+                    b' "prompt_eval_count": 5, "eval_count": 2}',
+                ]
+            )
+            body = {"model": "llama3", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+            body.update(extra)
+            return self.client.post("/v1/chat/completions", headers=self.headers, json=body)
+
+    @staticmethod
+    def _events(text):
+        return [line for line in text.split("\n\n") if line.startswith("data: ")]
+
+    def test_include_usage_adds_one_usage_chunk_before_done(self):
+        events = self._events(self._stream({"stream_options": {"include_usage": True}}).text)
+        self.assertEqual(events[-1], "data: [DONE]")
+        usage_chunk = json.loads(events[-2][len("data: "):])
+        self.assertEqual(usage_chunk["choices"], [])
+        self.assertEqual(
+            usage_chunk["usage"],
+            {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        )
+
+    def test_no_usage_chunk_unless_asked(self):
+        text = self._stream({}).text
+        self.assertEqual(text.count("data: [DONE]"), 1)
+        self.assertNotIn('"usage"', text)
+
+
+class KeyNameTests(unittest.TestCase):
+    def test_a_key_name_is_stored_and_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keys_file = os.path.join(tmp, "api_keys.json")
+            first = fresh_app(keys_file)
+            from fastapi.testclient import TestClient
+
+            with TestClient(first.app) as c:
+                created = c.post(
+                    "/api/keys",
+                    headers={"Authorization": f"Bearer {ADMIN}"},
+                    json={"name": "laptop"},
+                ).json()
+                listed = c.get("/api/keys", headers={"Authorization": f"Bearer {ADMIN}"}).json()
+            self.assertEqual(listed["keys"][0]["name"], "laptop")
+            self.assertIsInstance(listed["keys"][0]["created"], int)
+
+            second = fresh_app(keys_file)
+            self.assertEqual(second.KEY_META[created["api_key"]]["name"], "laptop")
+            sys.modules.pop("main", None)
+
+    def test_a_1_1_key_file_without_meta_still_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keys_file = os.path.join(tmp, "api_keys.json")
+            pathlib.Path(keys_file).write_text(
+                json.dumps({"keys": ["sk-old"], "admin": ADMIN}), encoding="utf-8"
+            )
+            main = fresh_app(keys_file)
+            self.assertIn("sk-old", main.VALID_API_KEYS)
+            self.assertEqual(main.KEY_META, {})
+            sys.modules.pop("main", None)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,7 +35,7 @@ load_dotenv()
 
 log = logging.getLogger("ollama-proxy")
 
-app = FastAPI(title="OpenAI to Ollama API Proxy", version="1.1.0")
+app = FastAPI(title="OpenAI to Ollama API Proxy", version="1.2.0")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
@@ -68,27 +68,31 @@ if not KEYS_FILE.is_absolute():
 # ── key store ────────────────────────────────────────────────────────────────
 def _load_store() -> Dict[str, Any]:
     if not KEYS_FILE.exists():
-        return {"keys": [], "admin": None}
+        return {"keys": [], "admin": None, "meta": {}}
     try:
         data = json.loads(KEYS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("cannot read %s (%s); starting from an empty allow-list", KEYS_FILE, exc)
-        return {"keys": [], "admin": None}
+        return {"keys": [], "admin": None, "meta": {}}
     # A hand-edited or mangled file must not crash startup, and must never
     # degrade into single-character "keys" that would authenticate anything.
     if not isinstance(data, dict):
         log.warning("%s is not a JSON object; starting from an empty allow-list", KEYS_FILE)
-        return {"keys": [], "admin": None}
+        return {"keys": [], "admin": None, "meta": {}}
     keys = data.get("keys")
     admin = data.get("admin")
+    # `meta` is new in 1.2; a file written by an older version has no such key
+    # and must still load.
+    meta = data.get("meta")
     return {
         "keys": keys if isinstance(keys, list) else [],
         "admin": admin if isinstance(admin, str) else None,
+        "meta": meta if isinstance(meta, dict) else {},
     }
 
 
 def _save_store() -> None:
-    payload = {"keys": sorted(VALID_API_KEYS), "admin": ADMIN_API_KEY}
+    payload = {"keys": sorted(VALID_API_KEYS), "admin": ADMIN_API_KEY, "meta": KEY_META}
     KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = KEYS_FILE.with_suffix(KEYS_FILE.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -104,6 +108,11 @@ def _new_key() -> str:
 
 _store = _load_store()
 VALID_API_KEYS = {k for k in _store["keys"] if isinstance(k, str) and k}
+# Per-key bookkeeping: the optional name an operator gave a key, and when it was
+# issued. The `name` used to be echoed back once and then thrown away.
+KEY_META: Dict[str, Dict[str, Any]] = {
+    key: value for key, value in _store["meta"].items() if isinstance(value, dict)
+}
 
 # Environment wins; otherwise reuse whatever was generated last time so a
 # restart does not lock the operator out of their own key management.
@@ -165,7 +174,12 @@ async def require_admin(auth_header: Optional[str] = Depends(API_KEY_HEADER)) ->
 # ── schemas ──────────────────────────────────────────────────────────────────
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    # Optional because an assistant message that only carries tool_calls has
+    # no text of its own; OpenAI sends `content: null` in that case.
+    content: Optional[str] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -175,11 +189,22 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None  # newer OpenAI SDKs send this
     stream: Optional[bool] = False
+    stream_options: Optional[Dict[str, Any]] = None  # {"include_usage": true}
     top_p: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     seed: Optional[int] = None
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None  # accepted for compatibility; Ollama has no equivalent
+
+
+class EmbeddingRequest(BaseModel):
+    model: str
+    input: Union[str, List[str]]
+    encoding_format: Optional[str] = None
+    dimensions: Optional[int] = None
+    user: Optional[str] = None
 
 
 class ChatCompletionResponseChoice(BaseModel):
@@ -205,12 +230,70 @@ def generate_id() -> str:
     return f"chatcmpl-{hashlib.sha256(secrets.token_bytes(16)).hexdigest()[:20]}"
 
 
+def _ollama_messages(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
+    """Forward the fields Ollama understands, including tool plumbing.
+
+    A plain chat message used to be reduced to {role, content}; that silently
+    dropped `tool_calls` / `tool_call_id`, so a client that ran a tool and sent
+    the result back got a conversation with no tool history at all.
+    """
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        item: Dict[str, Any] = {"role": m.role, "content": m.content or ""}
+        if m.tool_calls:
+            item["tool_calls"] = m.tool_calls
+        if m.tool_call_id:
+            item["tool_call_id"] = m.tool_call_id
+        if m.name:
+            item["name"] = m.name
+        out.append(item)
+    return out
+
+
+def _openai_tool_calls(raw: Any) -> List[Dict[str, Any]]:
+    """Ollama returns `arguments` as an object; OpenAI clients expect a JSON
+    *string* plus an id and `type: "function"`. Passing the object through
+    unchanged breaks every SDK that json-parses the arguments."""
+    calls: List[Dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return calls
+    for tc in raw:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        arguments = fn.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+        calls.append(
+            {
+                "id": tc.get("id") or f"call_{secrets.token_hex(8)}",
+                "type": "function",
+                "function": {"name": fn.get("name", ""), "arguments": arguments},
+            }
+        )
+    return calls
+
+
+def _token_usage(data: Dict[str, Any]) -> Dict[str, int]:
+    prompt_tokens = int(data.get("prompt_eval_count") or 0)
+    completion_tokens = int(data.get("eval_count") or 0)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
 def _ollama_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": request.model,
-        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        "messages": _ollama_messages(request.messages),
         "stream": bool(request.stream),
     }
+    if request.tools:
+        # Ollama uses the same {type, function} shape as OpenAI, so this is a
+        # pass-through rather than a translation.
+        payload["tools"] = request.tools
     options: Dict[str, Any] = {}
     if request.temperature is not None:
         # Ollama only reads sampling parameters from `options`; a top-level
@@ -308,9 +391,16 @@ async def chat_completions(
                 response.close()
             raise error
 
+        include_usage = bool(
+            isinstance(request.stream_options, dict)
+            and request.stream_options.get("include_usage")
+        )
+
         def generate():
             # Starlette runs a sync iterator in a worker thread, so this does not
             # block the event loop.
+            usage = None
+            seen_tool_calls = False
             try:
                 for line in response.iter_lines():
                     if not line:
@@ -325,6 +415,24 @@ async def chat_completions(
                         yield f"data: {json.dumps({'error': {'message': data['error']}})}\n\n"
                         break
                     done = bool(data.get("done"))
+                    message = data.get("message") or {}
+                    tool_calls = _openai_tool_calls(message.get("tool_calls"))
+                    if tool_calls:
+                        seen_tool_calls = True
+                    delta: Dict[str, Any] = {
+                        "role": "assistant",
+                        "content": message.get("content", ""),
+                    }
+                    if tool_calls:
+                        # Ollama emits the whole call list at once; OpenAI's
+                        # streaming schema is an array of indexed deltas.
+                        delta["tool_calls"] = [
+                            {"index": i, **tc} for i, tc in enumerate(tool_calls)
+                        ]
+                    if done:
+                        finish_reason = "tool_calls" if seen_tool_calls else "stop"
+                    else:
+                        finish_reason = None
                     chunk = {
                         "id": chat_id,
                         "object": "chat.completion.chunk",
@@ -333,16 +441,14 @@ async def chat_completions(
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "content": data.get("message", {}).get("content", ""),
-                                },
-                                "finish_reason": "stop" if done else None,
+                                "delta": delta,
+                                "finish_reason": finish_reason,
                             }
                         ],
                     }
                     yield f"data: {json.dumps(chunk)}\n\n"
                     if done:
+                        usage = _token_usage(data)
                         break
             except requests.exceptions.RequestException as exc:
                 # Connection dropped mid-stream: log it and end without [DONE]
@@ -353,6 +459,19 @@ async def chat_completions(
                 response.close()
             # After the finally, not in it: yielding while a GeneratorExit is
             # in flight (client disconnect) raises RuntimeError.
+            #
+            # `stream_options.include_usage` asks for one extra chunk carrying
+            # usage and an empty choices array, before [DONE].
+            if include_usage and usage is not None:
+                usage_chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_at,
+                    "model": request.model,
+                    "choices": [],
+                    "usage": usage,
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(generate(), media_type="text/event-stream")
@@ -374,10 +493,17 @@ async def chat_completions(
             status_code=502,
             detail="Ollama returned an unexpected response; check OLLAMA_BASE_URL",
         )
-    prompt_tokens = int(data.get("prompt_eval_count") or 0)
-    completion_tokens = int(data.get("eval_count") or 0)
+    message = data.get("message") or {}
+    tool_calls = _openai_tool_calls(message.get("tool_calls"))
+    content = message.get("content") or ""
+    if tool_calls:
+        # OpenAI sends `content: null` when the turn is only a tool call.
+        content = content or None
+        finish_reason = "tool_calls"
+    else:
+        finish_reason = "stop" if data.get("done", True) else None
 
-    return ChatCompletionResponse(
+    response = ChatCompletionResponse(
         id=chat_id,
         created=created_at,
         model=request.model,
@@ -386,17 +512,76 @@ async def chat_completions(
                 index=0,
                 message=ChatMessage(
                     role="assistant",
-                    content=data.get("message", {}).get("content", ""),
+                    content=content,
+                    tool_calls=tool_calls or None,
                 ),
-                finish_reason="stop" if data.get("done", True) else None,
+                finish_reason=finish_reason,
             )
         ],
-        usage={
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        usage=_token_usage(data),
     )
+    # OpenAI keeps `content: null` on a tool-only turn but omits the fields that
+    # do not apply; emitting `"tool_call_id": null` on a plain reply is noise
+    # that strict clients reject.
+    body = response.model_dump()
+    for choice in body["choices"]:
+        choice["message"] = {
+            key: value
+            for key, value in choice["message"].items()
+            if value is not None or key == "content"
+        }
+    return body
+
+
+@app.post("/v1/embeddings")
+async def embeddings(request: EmbeddingRequest, api_key: str = Depends(get_api_key)):
+    """Embeddings are what RAG clients (LlamaIndex, LangChain, vector stores)
+    hit first; without this endpoint the proxy could only serve chat."""
+    inputs = [request.input] if isinstance(request.input, str) else list(request.input)
+    if not inputs or any(not isinstance(text, str) for text in inputs):
+        raise HTTPException(
+            status_code=400, detail="input must be a string or a non-empty list of strings"
+        )
+
+    try:
+        response = await run_in_threadpool(
+            requests.post,
+            f"{OLLAMA_BASE_URL}/api/embed",
+            json={"model": request.model, "input": inputs},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise _ollama_error(exc)
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama returned an unexpected response; check OLLAMA_BASE_URL",
+        )
+
+    vectors = data.get("embeddings")
+    if not isinstance(vectors, list) or len(vectors) != len(inputs):
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama returned no embeddings; check that the model supports embeddings",
+        )
+
+    prompt_tokens = int(data.get("prompt_eval_count") or 0)
+    return {
+        "object": "list",
+        "data": [
+            {"object": "embedding", "index": index, "embedding": vector}
+            for index, vector in enumerate(vectors)
+        ],
+        "model": request.model,
+        # OpenAI reports tokens for the whole batch in one number.
+        "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
+    }
 
 
 # ── key management (admin only) ──────────────────────────────────────────────
@@ -406,8 +591,10 @@ async def create_api_key(
 ):
     new_key = _new_key()
     VALID_API_KEYS.add(new_key)
+    name = body.name if body else None
+    KEY_META[new_key] = {"name": name, "created": int(time.time())}
     _save_store()
-    return {"api_key": new_key, "name": body.name if body else None}
+    return {"api_key": new_key, "name": name}
 
 
 @app.get("/api/keys")
@@ -416,7 +603,13 @@ async def list_api_keys(admin: str = Depends(require_admin)):
     # an operator can tell them apart without handing out the secrets again.
     return {
         "keys": [
-            {"prefix": k[:11], "masked": k[:11] + "…" + k[-4:]} for k in sorted(VALID_API_KEYS)
+            {
+                "prefix": k[:11],
+                "masked": k[:11] + "…" + k[-4:],
+                "name": (KEY_META.get(k) or {}).get("name"),
+                "created": (KEY_META.get(k) or {}).get("created"),
+            }
+            for k in sorted(VALID_API_KEYS)
         ]
     }
 
@@ -426,6 +619,7 @@ async def delete_api_key(api_key: str, admin: str = Depends(require_admin)):
     for existing in list(VALID_API_KEYS):
         if _key_matches(existing, api_key):
             VALID_API_KEYS.discard(existing)
+            KEY_META.pop(existing, None)
             _save_store()
             return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="API key not found")
